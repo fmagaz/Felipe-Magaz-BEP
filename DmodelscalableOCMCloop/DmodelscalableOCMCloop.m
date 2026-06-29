@@ -1,0 +1,794 @@
+%% Scalable n-satellite 1D distributed KF_OCI with Monte Carlo
+%
+% Loop/ring topology:
+% satellite 1 -- satellite 2 -- ... -- satellite n -- satellite 1
+%
+% Global state:
+% x = [p1; v1; p2; v2; ...; pn; vn]
+%
+% Global measurements:
+% z_abs_i = p_i
+% z_rel_e = p_{e+1} - p_e, e = 1,...,n-1
+% z_rel_n = p_1 - p_n
+%
+% Each agent i estimates only:
+% x_i = [p_i; v_i]
+%
+% Each agent uses:
+% - its own absolute measurement
+% - relative measurement to left neighbor, if available
+% - relative measurement to right neighbor, if available
+%
+% KF_OCI gains are precomputed once because the gain/covariance recursion
+% is deterministic. Monte Carlo then reuses these gains.
+
+clear; clc; close all;
+
+%% Settings
+
+n  = 7;          % number of satellites
+dt = 0.1;
+N  = 1000;
+M  = 5000;
+
+t = (0:N)*dt;
+
+% Numerical / tuning parameters
+eps_prior = 1e-4;
+alpha = 1.00;
+gamma_vec = 1e-5 * ones(n,1);
+
+
+% Measurement noise
+sigma_abs = 10;
+sigma_rel = 1;
+
+% Process noise
+sigma_a_true   = 0.1  * ones(n,1);   % truth simulation
+sigma_a_filter = 0.1 * ones(n,1);   % filter covariance tuning
+
+% Initial local covariance
+P0_local = diag([10^2, 1^2]);
+
+% Plot/save settings
+make_plots = false;
+save_figures = false;
+figDir = 'C:\Users\20231656\Desktop\figures_sim';
+
+% tuning reproducibility
+% rng(1);
+
+assert(n >= 3, 'A loop/ring topology needs n >= 3.');
+
+%% Single-satellite model
+
+Hpos = [1 0];
+
+A1 = [1 dt;
+      0  1];
+
+B1 = [0.5*dt^2;
+      dt];
+
+Q_base = [dt^4/4, dt^3/2;
+          dt^3/2, dt^2];
+
+idx_p = @(i) 2*i - 1;
+idx_v = @(i) 2*i;
+idx_x = @(i) (2*i-1):(2*i);
+
+%% Global model
+
+A = kron(eye(n), A1);      % 2n x 2n
+B = kron(eye(n), B1);      % 2n x n
+
+% Initial true state
+
+x0 = zeros(2*n,1); 
+
+for i = 1:n
+    x0(idx_p(i)) = 50*(i-1);
+    x0(idx_v(i)) = 0;
+end
+
+% Inputs
+
+u = zeros(n,N);
+
+for i = 1:n
+    u(i,:) = 0.25 * i * sawtooth( ...
+        2*pi*(3+(i-1))*(1:N)/N - 0.5*pi*(i-1), 0.5);
+end
+
+% Process noise matrices
+
+Q_true = zeros(2*n);
+Q_filter_cell = cell(n,1);
+
+for i = 1:n
+    idx = idx_x(i);
+
+    Q_i_true   = sigma_a_true(i)^2   * Q_base;
+    Q_i_filter = sigma_a_filter(i)^2 * Q_base;
+
+    Q_true(idx,idx) = Q_i_true;
+    Q_filter_cell{i} = Q_i_filter;
+end
+
+% Global measurement model
+
+% Absolute position measurement matrix
+Cpos = kron(eye(n), Hpos);   % n x 2n
+
+% Loop/ring relative measurement edges:
+% edge e = [e, e+1] gives p_{e+1} - p_e for e = 1,...,n-1
+% final edge [n, 1] gives p_1 - p_n
+
+edges = [(1:n)' [2:n 1]'];   % n x 2
+
+num_edges = size(edges,1);
+
+D = zeros(num_edges,n);
+
+for e = 1:num_edges
+    i = edges(e,1);
+    j = edges(e,2);
+
+    D(e,i) = -1;
+    D(e,j) =  1;
+end
+
+C_abs = Cpos;
+C_rel = D*Cpos;
+
+Cglob = [C_abs;
+         C_rel];
+
+R_abs = sigma_abs^2 * eye(n);
+R_rel = sigma_rel^2 * eye(num_edges);
+
+Rglob = blkdiag(R_abs, R_rel);
+
+num_meas = n + num_edges;
+
+% Building local measurement structures
+
+local = cell(n,1);
+
+for i = 1:n
+    local{i} = build_local_structure_loop(i, n, Hpos);
+end
+
+%% Precomputation of deterministic KF_OCI gain and covariance histories
+
+fprintf('Precomputing deterministic KF_OCI gain schedule...\n');
+
+Pcell = cell(n,1);
+Ppred = cell(n,1);
+
+for i = 1:n
+    Pcell{i} = P0_local;
+end
+
+P_hist = zeros(2,2,N+1,n);
+
+for i = 1:n
+    P_hist(:,:,1,i) = Pcell{i};
+end
+
+% K_hist{i,k} has size 2 x m_i, where m_i = 1 + degree(i)
+K_hist = cell(n,N);
+
+% Optional storage
+Xii_hist = zeros(2,2,N+1,n);
+for i = 1:n
+    Xii_hist(:,:,1,i) = Pcell{i};
+end
+
+for k = 1:N
+
+    % Prediction covariance for all agents
+
+    for i = 1:n
+        Ppred{i} = alpha*(A1*Pcell{i}*A1') + Q_filter_cell{i};
+        Ppred{i} = clean_cov(Ppred{i});
+    end
+
+    % Gain computation
+
+    if k == 1
+
+        % First update: exact local minimum-variance gain because the
+        % initial global predicted covariance is known and block diagonal.
+
+        Pglob_pred = blkdiag(Ppred{:});
+
+        for i = 1:n
+
+            [C_all_i, R_i_mv] = build_local_global_measurement_matrix_loop( ...
+                i, n, local{i}, sigma_abs, sigma_rel, Hpos);
+
+            S_i = R_i_mv + C_all_i*Pglob_pred*C_all_i';
+
+            Pcross_i = zeros(2,2*n);
+            Pcross_i(:,idx_x(i)) = Ppred{i};
+
+            G_i = Pcross_i*C_all_i';
+
+            K_i = G_i / S_i;
+
+            Ppost_i = Ppred{i} - K_i*S_i*K_i';
+            Ppost_i = clean_cov(Ppost_i);
+
+            K_hist{i,k} = K_i;
+            Pcell{i} = Ppost_i;
+
+            P_hist(:,:,k+1,i) = Pcell{i};
+            Xii_hist(:,:,k+1,i) = Pcell{i};
+
+        end
+
+    else
+
+        % k >= 2: use KF_OCI for each local agent
+
+        for i = 1:n
+
+            [K_i, Ppost_i] = compute_local_KF_OCI_gain( ...
+                i, local{i}, Ppred, sigma_abs, sigma_rel, ...
+                eps_prior, gamma_vec(i), Hpos);
+
+            K_hist{i,k} = K_i;
+
+            Pcell{i} = clean_cov(Ppost_i);
+
+            P_hist(:,:,k+1,i) = Pcell{i};
+            Xii_hist(:,:,k+1,i) = Pcell{i};
+
+        end
+
+    end
+
+    if mod(k,10) == 0
+        fprintf('OCI step %d / %d\n', k, N);
+    end
+
+end
+
+fprintf('OCI gain schedule complete.\n');
+
+%% Monte Carlo simulation loop using precomputed gains
+
+fprintf('Running Monte Carlo simulations...\n');
+
+err_hist = zeros(2*n, N+1, M);
+xhat_hist = zeros(2*n, N+1, M);
+
+rough_v_mc = zeros(n,M);
+
+% Storing final MC run for plots
+x_true_last = [];
+z_last = [];
+xhat_last = [];
+
+for m = 1:M
+
+    % True simulation
+
+    x_true = zeros(2*n, N+1);
+    x_true(:,1) = x0;
+
+    w = mvnrnd(zeros(1,2*n), Q_true, N)';
+
+    for k = 1:N
+        x_true(:,k+1) = A*x_true(:,k) + B*u(:,k) + w(:,k);
+    end
+
+    % Measurement generation
+
+    meas_noise = mvnrnd(zeros(1,num_meas), Rglob, N+1)';
+    z = Cglob*x_true + meas_noise;
+
+    % Distributed local filtering
+
+    xhat = zeros(2*n, N+1);
+
+    for i = 1:n
+        xhat(idx_x(i),1) = x0(idx_x(i)) + mvnrnd(zeros(1,2), P0_local)';
+    end
+
+    for k = 1:N
+
+        % Predict all agents first
+        xpred = A*xhat(:,k) + B*u(:,k);
+
+        xhat_next = zeros(2*n,1);
+
+        for i = 1:n
+
+            idx_i = idx_x(i);
+
+            zmeas_i = build_local_zmeas_loop( ...
+                i, n, z(:,k+1), xpred, local{i}, Hpos);
+
+            innov_i = zmeas_i - local{i}.Cself*xpred(idx_i);
+
+            xhat_next(idx_i) = xpred(idx_i) + K_hist{i,k}*innov_i;
+
+        end
+
+        xhat(:,k+1) = xhat_next;
+
+    end
+
+    % Storing MC errors
+
+    err_hist(:,:,m) = x_true - xhat;
+    xhat_hist(:,:,m) = xhat;
+
+    for i = 1:n
+        dv = diff(xhat(idx_v(i),:));
+        rough_v_mc(i,m) = sqrt(mean(dv.^2));
+    end
+
+    if m == M
+        x_true_last = x_true;
+        z_last = z;
+        xhat_last = xhat;
+    end
+
+    fprintf('MC run %d / %d complete\n', m, M);
+
+end
+
+fprintf('Monte Carlo complete.\n');
+
+%% Monte Carlo empirical covariance
+
+% For scalability, only diagonal empirical covariance is taken, which is enough for 3-sigma bounds.
+
+P_mc_diag = zeros(2*n, N+1);
+
+for k = 1:N+1
+    E = squeeze(err_hist(:,k,:));      % 2n x M
+    P_mc_diag(:,k) = var(E, 0, 2);     % empirical variance of each state
+end
+
+% Theoretical and empirical sigma bounds
+
+sigma_p = zeros(n,N+1);
+sigma_v = zeros(n,N+1);
+
+sigma_p_mc = zeros(n,N+1);
+sigma_v_mc = zeros(n,N+1);
+
+for i = 1:n
+    sigma_p(i,:) = sqrt(squeeze(P_hist(1,1,:,i)))';
+    sigma_v(i,:) = sqrt(squeeze(P_hist(2,2,:,i)))';
+
+    sigma_p_mc(i,:) = sqrt(P_mc_diag(idx_p(i),:));
+    sigma_v_mc(i,:) = sqrt(P_mc_diag(idx_v(i),:));
+end
+
+%% Monte Carlo summary metrics
+
+err_all = reshape(err_hist, 2*n, []);
+
+rmse_state = sqrt(mean(err_all.^2, 2));
+
+rmse_p = rmse_state(1:2:end);
+rmse_v = rmse_state(2:2:end);
+
+rough_v_mean = mean(rough_v_mc, 2);
+
+within_p = zeros(n,1);
+within_v = zeros(n,1);
+
+for i = 1:n
+
+    E_p = squeeze(err_hist(idx_p(i),:,:));   % (N+1) x M
+    E_v = squeeze(err_hist(idx_v(i),:,:));
+
+    bound_p = repmat(3*sigma_p(i,:)', 1, M);
+    bound_v = repmat(3*sigma_v(i,:)', 1, M);
+
+    mask_p = abs(E_p) <= bound_p;
+    mask_v = abs(E_v) <= bound_v;
+
+    within_p(i) = mean(mask_p(:));
+    within_v(i) = mean(mask_v(:));
+
+end
+
+fprintf('\nMonte Carlo results over %d runs:\n', M);
+
+fprintf('RMSE position [m]:\n');
+disp(rmse_p.');
+
+fprintf('RMSE velocity [m/s]:\n');
+disp(rmse_v.');
+
+fprintf('Mean velocity roughness [m/s]:\n');
+disp(rough_v_mean.');
+
+fprintf('Position inside KF_OCI 3sigma [%%]:\n');
+disp(100*within_p.');
+
+fprintf('Velocity inside KF_OCI 3sigma [%%]:\n');
+disp(100*within_v.');
+
+%% Plots
+
+if make_plots
+
+    % Absolute position figure for each satellite
+
+    for i = 1:n
+        figure('Name',sprintf('Satellite_%d_position',i));
+        plot(t, x_true_last(idx_p(i),:), 'LineWidth', 1.5); hold on;
+        plot(t, z_last(i,:), '.', 'MarkerSize', 5);
+        plot(t, xhat_last(idx_p(i),:), 'LineWidth', 1.5);
+
+        xlabel('Time [s]');
+        ylabel(sprintf('Position p_%d [m]', i));
+        legend('True','Measured abs','Agent estimate');
+        grid on;
+        title(sprintf('Satellite %d position', i));
+    end
+
+    % Relative position figure for each chain edge
+
+    for e = 1:num_edges
+
+        i = edges(e,1);
+        j = edges(e,2);
+
+        p_rel_true = x_true_last(idx_p(j),:) - x_true_last(idx_p(i),:);
+        p_rel_est  = xhat_last(idx_p(j),:) - xhat_last(idx_p(i),:);
+
+        figure('Name',sprintf('Relative_position_satellites_%d_and_%d',i,j));
+        plot(t, p_rel_true, 'LineWidth', 1.5); hold on;
+        plot(t, z_last(n+e,:), '.', 'MarkerSize', 5);
+        plot(t, p_rel_est, 'LineWidth', 1.5);
+
+        xlabel('Time [s]');
+        ylabel(sprintf('Relative position p_%d - p_%d [m]', j, i));
+        legend('True','Measured rel','Distributed estimate');
+        grid on;
+        title(sprintf('Relative position: satellites %d and %d', i, j));
+
+    end
+
+    % Velocities of all satellites
+
+    figure('Name','Velocities_of_all_satellites'); hold on;
+
+    for i = 1:n
+        plot(t, x_true_last(idx_v(i),:), 'LineWidth', 1.5, ...
+            'DisplayName', sprintf('True v_%d', i));
+
+        plot(t, xhat_last(idx_v(i),:), '--', 'LineWidth', 1.5, ...
+            'DisplayName', sprintf('Agent %d estimate', i));
+    end
+
+    xlabel('Time [s]');
+    ylabel('Velocity [m/s]');
+    legend('Location','bestoutside');
+    grid on;
+    title('Velocities of all satellites');
+
+    % Inputs
+
+    figure('Name','Control_inputs'); hold on;
+
+    for i = 1:n
+        plot(t(1:N), u(i,:), 'LineWidth', 1.5, ...
+            'DisplayName', sprintf('u_%d', i));
+    end
+
+    xlabel('Time [s]');
+    ylabel('Acceleration [m/s^2]');
+    legend('Location','bestoutside');
+    grid on;
+    title('Control inputs');
+
+    % Position error plots
+
+    err_last = x_true_last - xhat_last;
+
+    for i = 1:n
+
+        figure('Name',sprintf('Position_error_satellite_%d',i));
+        plot(t, err_last(idx_p(i),:), 'LineWidth', 1.5); hold on;
+
+        plot(t,  3*sigma_p(i,:), '--r');
+        plot(t, -3*sigma_p(i,:), '--r');
+
+        plot(t,  3*sigma_p_mc(i,:), '--g');
+        plot(t, -3*sigma_p_mc(i,:), '--g');
+
+        xlabel('Time [s]');
+        ylabel('Position error [m]');
+        legend('Error','+3\sigma KF-OCI','-3\sigma KF-OCI', ...
+               '+3\sigma MC','-3\sigma MC');
+        grid on;
+        title(sprintf('Position error satellite %d', i));
+
+    end
+
+    % Velocity error plots
+
+    for i = 1:n
+
+        figure('Name',sprintf('Velocity_error_satellite_%d',i));
+        plot(t, err_last(idx_v(i),:), 'LineWidth', 1.5); hold on;
+
+        plot(t,  3*sigma_v(i,:), '--r');
+        plot(t, -3*sigma_v(i,:), '--r');
+
+        plot(t,  3*sigma_v_mc(i,:), '--g');
+        plot(t, -3*sigma_v_mc(i,:), '--g');
+
+        xlabel('Time [s]');
+        ylabel('Velocity error [m/s]');
+        legend('Error','+3\sigma KF-OCI','-3\sigma KF-OCI', ...
+               '+3\sigma MC','-3\sigma MC');
+        grid on;
+        title(sprintf('Velocity error satellite %d', i));
+
+    end
+
+    % Common-mode position error
+
+    pos_err_last = zeros(n,N+1);
+
+    for i = 1:n
+        pos_err_last(i,:) = err_last(idx_p(i),:);
+    end
+
+    e_common = mean(pos_err_last,1);
+
+    figure('Name','Common_mode_position_error');
+    plot(t, e_common, 'LineWidth', 1.5);
+    xlabel('Time [s]');
+    ylabel('Common position error [m]');
+    grid on;
+    title('Common-mode position error');
+
+    % Relative error components for every edge
+
+    figure('Name','Relative_error_components'); hold on;
+
+    for e = 1:num_edges
+
+        i = edges(e,1);
+        j = edges(e,2);
+
+        e_rel = err_last(idx_p(j),:) - err_last(idx_p(i),:);
+
+        plot(t, e_rel, 'LineWidth', 1.5, ...
+            'DisplayName', sprintf('e_%d - e_%d', j, i));
+
+    end
+
+    xlabel('Time [s]');
+    ylabel('Relative error difference [m]');
+    legend('Location','bestoutside');
+    grid on;
+    title('Relative error components');
+
+    % Absolute position gain plot
+
+    Kabs_pos = zeros(n,N);
+
+    for i = 1:n
+        for k = 1:N
+            Kabs_pos(i,k) = K_hist{i,k}(1,1);
+        end
+    end
+
+    figure('Name','Absolute_measurement_gain'); hold on;
+
+    for i = 1:n
+        plot(t(1:N), Kabs_pos(i,:), 'LineWidth', 1.5, ...
+            'DisplayName', sprintf('Agent %d', i));
+    end
+
+    xlabel('Time [s]');
+    ylabel('Position gain on absolute measurement');
+    legend('Location','bestoutside');
+    grid on;
+    title('Absolute measurement gain');
+
+    % Relative position gains
+
+    figure('Name','Relative_measurement_gains'); hold on;
+
+    for i = 1:n
+
+        deg_i = numel(local{i}.neighbors);
+
+        for r = 1:deg_i
+
+            gain_hist = zeros(1,N);
+
+            % Column 1 is absolute measurement.
+            % Relative measurement columns start from 2.
+            col = 1 + r;
+
+            for k = 1:N
+                gain_hist(k) = K_hist{i,k}(1,col);
+            end
+
+            neigh = local{i}.neighbors(r);
+
+            plot(t(1:N), gain_hist, 'LineWidth', 1.5, ...
+                'DisplayName', sprintf('Agent %d rel with %d', i, neigh));
+
+        end
+    end
+
+    xlabel('Time [s]');
+    ylabel('Position gain on relative measurements');
+    legend('Location','bestoutside');
+    grid on;
+    title('Relative measurement gains');
+
+    % Velocity gain components per agent
+
+    for i = 1:n
+
+        figure('Name',sprintf('Agent_%d_velocity_gain_components',i));
+        hold on;
+
+        % Absolute velocity gain
+        gain_abs = zeros(1,N);
+        for k = 1:N
+            gain_abs(k) = K_hist{i,k}(2,1);
+        end
+
+        plot(t(1:N), gain_abs, 'LineWidth', 1.5, ...
+            'DisplayName','abs');
+
+        % Relative velocity gains
+        deg_i = numel(local{i}.neighbors);
+
+        for r = 1:deg_i
+
+            col = 1 + r;
+            gain_rel = zeros(1,N);
+
+            for k = 1:N
+                gain_rel(k) = K_hist{i,k}(2,col);
+            end
+
+            neigh = local{i}.neighbors(r);
+
+            plot(t(1:N), gain_rel, 'LineWidth', 1.5, ...
+                'DisplayName', sprintf('rel with %d', neigh));
+
+        end
+
+        xlabel('Time [s]');
+        ylabel(sprintf('Agent %d velocity gain', i));
+        legend('Location','best');
+        grid on;
+        title(sprintf('Agent %d velocity gain components', i));
+
+    end
+
+end
+
+%% 6. Saving figures
+
+if make_plots && save_figures
+
+    if ~exist(figDir, 'dir')
+        mkdir(figDir);
+    end
+
+    sigmaTag = sprintf('sigmaaf_%g', sigma_a_filter(1));
+    epsTag   = sprintf('eps_%g', eps_prior);
+    nTag     = sprintf('n_%d', n);
+    MTag     = sprintf('MC_%d', M);
+
+    if all(gamma_vec == gamma_vec(1))
+        gammaTag = sprintf('gamma_%g', gamma_vec(1));
+    else
+        gammaTag = sprintf('gamma_first_%g_mid_%g_last_%g', ...
+            gamma_vec(1), gamma_vec(min(2,n)), gamma_vec(end));
+    end
+
+    paramTag = [nTag, '_', sigmaTag, '_', gammaTag, '_', epsTag, '_', MTag];
+
+    figs = findall(groot, 'Type', 'figure');
+
+    figNums = zeros(numel(figs),1);
+    for i = 1:numel(figs)
+        figNums(i) = figs(i).Number;
+    end
+
+    [~, order] = sort(figNums);
+    figs = figs(order);
+
+    for i = 1:numel(figs)
+
+        fig = figs(i);
+
+        name = fig.Name;
+
+        if isempty(name)
+            ax = findall(fig, 'Type', 'axes');
+
+            if ~isempty(ax)
+                titleText = ax(1).Title.String;
+
+                if iscell(titleText)
+                    titleText = strjoin(titleText, '_');
+                elseif isstring(titleText)
+                    titleText = char(titleText);
+                end
+
+                name = titleText;
+            end
+        end
+
+        if isempty(name)
+            name = sprintf('figure_%02d', fig.Number);
+        end
+
+        name = char(name);
+        name = regexprep(name, '[^\w\d-]', '_');
+        name = regexprep(name, '_+', '_');
+
+        fileBase = sprintf('%02d_%s_%s', fig.Number, name, paramTag);
+
+        pngFile = fullfile(figDir, [fileBase, '.png']);
+        figFile = fullfile(figDir, [fileBase, '.fig']);
+
+        try
+            exportgraphics(fig, pngFile, 'Resolution', 300);
+        catch
+            saveas(fig, pngFile);
+        end
+
+        savefig(fig, figFile);
+
+    end
+
+    fprintf('Saved %d figures to:\n%s\n', numel(figs), figDir);
+
+end
+
+%% Save simulation data for plot-only reruns
+
+dataDir = 'C:\Users\20231656\Desktop\RESULTS';
+if ~exist(dataDir, 'dir')
+    mkdir(dataDir);
+end
+
+dataFile = fullfile(dataDir, sprintf('OCI_sim_data_loop_n_%d_MC_%d.mat', n, M));
+
+save(dataFile, ...
+    'n', 'dt', 'N', 'M', 't', ...
+    'u', ...
+    'edges', 'local', ...
+    'x0', ...
+    'x_true_last', 'z_last', 'xhat_last', ...
+    'err_hist', 'xhat_hist', ...
+    'P_hist', 'P_mc_diag', ...
+    'K_hist', ...
+    'sigma_p', 'sigma_v', ...
+    'sigma_p_mc', 'sigma_v_mc', ...
+    'rmse_p', 'rmse_v', ...
+    'rough_v_mean', ...
+    'within_p', 'within_v', ...
+    'gamma_vec', ...
+    'sigma_abs', 'sigma_rel', ...
+    'sigma_a_true', 'sigma_a_filter', ...
+    'eps_prior', 'alpha', ...
+    'Cglob', 'Rglob', ...
+    'Q_true', 'Q_filter_cell', ...
+    '-v7.3');
+
+fprintf('Saved simulation data to:\n%s\n', dataFile);
